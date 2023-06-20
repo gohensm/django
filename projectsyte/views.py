@@ -1,16 +1,18 @@
-from django.shortcuts import render, redirect
-from django.template.loader import render_to_string
+from django.shortcuts import render, redirect, get_object_or_404
 from .models import Post, Comment, Like,  Profile
 from django.http import JsonResponse
 from django.urls import reverse_lazy
-from .forms import PostForm, RegistrationForm, ProfileForm
+from .forms import PostForm, RegistrationForm, ProfileForm,  AvatarUploadForm, CommentForm 
 from django.views.generic.list import ListView
 from django.contrib.auth.views import LoginView, LogoutView
 from django.views.generic.edit import CreateView
 from django.views.generic.base import TemplateView
 from django.contrib import messages
-from .forms import AvatarUploadForm
 from django.http import HttpResponseRedirect
+from django.views import View
+from django.http import request
+from django.template.loader import render_to_string
+
 
 def index(request):
     posts = Post.objects.all()
@@ -18,11 +20,29 @@ def index(request):
     return render(request, 'index.html', context)
 
 
-class HomeView(ListView):
-    template_name = 'home.html'
-    model = Post
-    context_object_name = 'posts'
-
+class HomeView(View):
+    def get(self, request):
+        posts = Post.objects.all()
+        return render(request, 'home.html', {'posts': posts})
+    
+    def post(self, request, *args, **kwargs):
+        data = request.POST
+        files = request.FILES
+        user = self.request.user
+        post = Post.objects.get(id=self.kwargs['pk'])
+        if 'comment' in data:
+                post_id = data.get('post_id')
+                post = Post.objects.get(id=post_id)
+                form = CommentForm(data)
+                comment = form.save(commit=False)
+                comment.post = post
+                comment.author = request.user
+                comment.save()
+                context = {
+                'comment_html': f'<div class="comment"><p>{comment.author}: {comment.content}</p></div>'
+                    }
+                return JsonResponse(context)
+                
     def get_context_data(self, *, object_list=None, **kwargs):
         context = super().get_context_data(**kwargs)
         context['title'] = 'Home'
@@ -38,7 +58,33 @@ class Login(LoginView):
         messages.error(self.request, 'Неправильний логін або пароль')
         return super().form_invalid(form)
 
+class AddCommentView(View):
+    def post(self, request, post_id):
+        post = get_object_or_404(Post, id=post_id)
+        form = CommentForm(request.POST, request.FILES)
+        if form.is_valid():
+            comment = form.save(commit=False)
+            comment.post = post
+            comment.author = request.user
+            comment.save()
+            context = {
+                'comment_html': f'<div class="comment"><p>{comment.author}: {comment.content}</p></div>'
+            }
+            return JsonResponse(context)
+        return JsonResponse({'error': 'Invalid form data.'}, status=400)
 
+class LikePostView(View):
+    def post(self, request, post_id):
+        post = get_object_or_404(Post, id=post_id)
+        user = request.user
+        existing_like = Like.objects.filter(user=user, post=post).first()
+        if existing_like:
+            existing_like.delete()
+        else:
+            like = Like(user=user, post=post)
+            like.save()
+        likes_count = post.likes.count()
+        return JsonResponse({'likes_count': likes_count})
 
 
 class LogoutPage(LogoutView):
@@ -54,42 +100,22 @@ class RegistrationView(CreateView):
 class PostView(PostForm):
     template_name = 'Post.html'
 
+    def get(self, request, pk):
+        post = Post.objects.get(id=pk)
+        comments = Comment.objects.filter(post=post, parent_comment=None)
+        return render(request, self.template_name, {'post': post, 'comments': comments})
+
     def post(self, request, *args, **kwargs):
         data = request.POST
+        files = request.FILES
         user = self.request.user
         post = Post.objects.get(id=self.kwargs['pk'])
-        if 'text' in data.keys():
-            comment = Comment(user=user, post=post, body=data['text'])
-            comment.save()
-            result = render_to_string('comment.html', {'user': user, 'comment': comment})
-            return JsonResponse(result, safe=False)
-        if 'like' in data.keys():
-            like = Like.objects.filter(post=post)
-            is_like = 0
-            for i in like:
-                if i.user == user:
-                    i.delete()
-                    break
-            else:
-                is_like = 1
-                l = Like(post=post, user=user)
-                l.save()
-            return JsonResponse({'like_amount': len(Like.objects.filter(post=post)), 'isLike': is_like}, safe=False)
-        if 'is_like' in data.keys():
-            like = Like.objects.filter(post=post)
-            for i in like:
-                if i.user == user:
-                    return JsonResponse({'like': 1}, safe=False)
-            else:
-                return JsonResponse({'like': 0}, safe=False)
-        if 'id_comment' in data.keys():
-            comment = Comment.objects.get(id=int(data['id_comment']))
-            like = Like.objects.filter(comment=comment)
-            for i in like:
-                if i.user == user:
-                    return JsonResponse({'like': 1, 'like_amount': len(Like.objects.filter(comment=comment))}, safe=False)
-                else:
-                    return JsonResponse({'like': 0, 'like_amount': len(Like.objects.filter(comment=comment))}, safe=False)
+        if 'image' in files:
+            image = files['image']
+            post.image = image
+            post.save()
+            return redirect('post', pk=post.pk)
+            
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -105,26 +131,28 @@ class PostView(PostForm):
         context['comments'] = c_likes
         return context
 
+    
 
-class ProfileView(TemplateView):
+
+class ProfileView(View):
     template_name = 'profile.html'
 
-    def get_context_data(self, **kwargs):
-        context = super().get_context_data(**kwargs)
+    def get(self, request, *args, **kwargs):
         user = self.request.user
-        context['user'] = user
-        context['posts'] = Post.objects.filter(author=user)
-        context['title'] = 'Profile'
-        context['avatar_form'] = AvatarUploadForm()
-        return context
-    
+        avatar_form = AvatarUploadForm()
+        context = {
+            'user': user,
+            'avatar_form': avatar_form,
+        }
+        return render(request, self.template_name, context)
+
     def post(self, request, *args, **kwargs):
         form = AvatarUploadForm(request.POST, request.FILES)
         if form.is_valid():
-            profile = self.request.user
+            profile = request.user.profile
             profile.avatar = form.cleaned_data['avatar']
             profile.save()
-            return HttpResponseRedirect('/profile')
+            return redirect('/profile')
         else:
             return render(request, self.template_name, {'avatar_form': form})
     
